@@ -1,0 +1,204 @@
+const express = require('express');
+const crypto = require('crypto');
+const path = require('path');
+const fs = require('fs');
+const multer = require('multer');
+const db = require('./src/db');
+
+const app = express();
+const PORT = process.env.PORT || 3456;
+const ADMIN_PASS = process.env.ADMIN_PASS || 'grao2026';
+
+// ── Uploads ──
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir, { recursive: true });
+
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, uploadDir),
+  filename: (req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}-${crypto.randomBytes(4).toString('hex')}${ext}`);
+  }
+});
+const upload = multer({
+  storage,
+  limits: { fileSize: 20 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    const allowed = /jpeg|jpg|png|gif|webp|svg|pdf|doc|docx|txt|zip|rar/;
+    const ext = allowed.test(path.extname(file.originalname).toLowerCase());
+    const mime = allowed.test(file.mimetype.split('/')[1]) || file.mimetype.startsWith('image/') || file.mimetype.startsWith('application/');
+    cb(null, ext || mime);
+  }
+});
+
+// ── Middleware ──
+app.use(express.json({ limit: '20mb' }));
+app.use(express.urlencoded({ extended: true, limit: '20mb' }));
+app.use('/public', express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadDir));
+
+// ── Admin Auth Middleware ──
+function adminAuth(req, res, next) {
+  const pass = req.headers['x-admin-pass'] || req.query.pass;
+  if (pass === ADMIN_PASS) return next();
+  res.status(401).json({ error: 'Senha incorreta' });
+}
+
+// ── Helpers ──
+function defaultSections() {
+  return [
+    { key: 'logo', title: 'Logotipo da Empresa' },
+    { key: 'empresa', title: 'Sobre a Empresa' },
+    { key: 'servicos', title: 'Serviços / Produtos' },
+    { key: 'diferenciais', title: 'Diferenciais' },
+    { key: 'equipe', title: 'Equipe' },
+    { key: 'depoimentos', title: 'Depoimentos' },
+    { key: 'contato', title: 'Contato / Localização' },
+    { key: 'imagens', title: 'Imagens / Fotos' },
+    { key: 'cores', title: 'Cores e Referências Visuais' },
+    { key: 'extras', title: 'Informações Adicionais' },
+  ];
+}
+
+// ═══════════════════════════════════════
+// ADMIN ROUTES
+// ═══════════════════════════════════════
+
+app.get('/admin', (req, res) => {
+  res.type('html').send(fs.readFileSync(path.join(__dirname, 'public', 'admin.html'), 'utf8'));
+});
+
+// Login check
+app.post('/api/admin/login', (req, res) => {
+  const { password } = req.body;
+  if (password === ADMIN_PASS) {
+    res.json({ ok: true, token: ADMIN_PASS });
+  } else {
+    res.status(401).json({ error: 'Senha incorreta' });
+  }
+});
+
+app.get('/api/admin/projects', adminAuth, (req, res) => {
+  const projects = db.prepare(`
+    SELECT p.*,
+      (SELECT COUNT(*) FROM sections WHERE project_id = p.id) as total_sections,
+      (SELECT COUNT(*) FROM sections WHERE project_id = p.id AND done = 1) as done_sections
+    FROM projects p ORDER BY p.created_at DESC
+  `).all();
+  res.json(projects);
+});
+
+app.post('/api/admin/projects', adminAuth, (req, res) => {
+  const { client_name, client_email, site_type } = req.body;
+  const token = crypto.randomBytes(8).toString('hex');
+  const result = db.prepare(`
+    INSERT INTO projects (token, client_name, client_email, site_type)
+    VALUES (?, ?, ?, ?)
+  `).run(token, client_name, client_email || '', site_type || 'institucional');
+
+  const insertSection = db.prepare('INSERT INTO sections (project_id, key, title) VALUES (?, ?, ?)');
+  for (const s of defaultSections()) {
+    insertSection.run(result.lastInsertRowid, s.key, s.title);
+  }
+  res.json({ id: result.lastInsertRowid, token, link: `/briefing/${token}` });
+});
+
+app.get('/api/admin/projects/:id', adminAuth, (req, res) => {
+  const project = db.prepare('SELECT * FROM projects WHERE id = ?').get(req.params.id);
+  if (!project) return res.status(404).json({ error: 'Not found' });
+  const sections = db.prepare('SELECT * FROM sections WHERE project_id = ? ORDER BY id').all(req.params.id);
+  res.json({ ...project, sections });
+});
+
+app.patch('/api/admin/projects/:projectId/sections/:sectionId', adminAuth, (req, res) => {
+  const { done } = req.body;
+  db.prepare('UPDATE sections SET done = ? WHERE id = ? AND project_id = ?')
+    .run(done ? 1 : 0, req.params.sectionId, req.params.projectId);
+  res.json({ ok: true });
+});
+
+app.delete('/api/admin/projects/:id', adminAuth, (req, res) => {
+  db.prepare('DELETE FROM sections WHERE project_id = ?').run(req.params.id);
+  db.prepare('DELETE FROM projects WHERE id = ?').run(req.params.id);
+  res.json({ ok: true });
+});
+
+// Upload logo
+app.post('/api/admin/projects/:id/logo', adminAuth, upload.single('logo'), (req, res) => {
+  if (!req.file) return res.status(400).json({ error: 'No file' });
+  const logoPath = `/uploads/${req.file.filename}`;
+  db.prepare('UPDATE projects SET logo_path = ? WHERE id = ?').run(logoPath, req.params.id);
+  res.json({ ok: true, path: logoPath });
+});
+
+// ═══════════════════════════════════════
+// CLIENT ROUTES
+// ═══════════════════════════════════════
+
+app.get('/briefing/:token', (req, res) => {
+  res.type('html').send(fs.readFileSync(path.join(__dirname, 'public', 'client.html'), 'utf8'));
+});
+
+app.get('/api/client/:token', (req, res) => {
+  const project = db.prepare('SELECT * FROM projects WHERE token = ?').get(req.params.token);
+  if (!project) return res.status(404).json({ error: 'Projeto não encontrado' });
+  const sections = db.prepare('SELECT * FROM sections WHERE project_id = ? ORDER BY id').all(project.id);
+  res.json({ ...project, sections });
+});
+
+app.put('/api/client/:token/sections/:key', (req, res) => {
+  const project = db.prepare('SELECT * FROM projects WHERE token = ?').get(req.params.token);
+  if (!project) return res.status(404).json({ error: 'Projeto não encontrado' });
+
+  const section = db.prepare('SELECT * FROM sections WHERE project_id = ? AND key = ?')
+    .get(project.id, req.params.key);
+  if (!section) return res.status(404).json({ error: 'Seção não encontrada' });
+  if (section.done) return res.status(403).json({ error: 'Esta aba já foi concluída pelo admin' });
+
+  const { content, images, files } = req.body;
+  db.prepare('UPDATE sections SET content = ?, images = ?, files = ? WHERE id = ?')
+    .run(content || '', JSON.stringify(images || []), JSON.stringify(files || []), section.id);
+  res.json({ ok: true });
+});
+
+// Upload image/file for client section
+app.post('/api/client/:token/sections/:key/upload', upload.array('files', 10), (req, res) => {
+  const project = db.prepare('SELECT * FROM projects WHERE token = ?').get(req.params.token);
+  if (!project) return res.status(404).json({ error: 'Projeto não encontrado' });
+
+  const section = db.prepare('SELECT * FROM sections WHERE project_id = ? AND key = ?')
+    .get(project.id, req.params.key);
+  if (!section) return res.status(404).json({ error: 'Seção não encontrada' });
+  if (section.done) return res.status(403).json({ error: 'Esta aba já foi concluída' });
+
+  const uploaded = (req.files || []).map(f => ({
+    name: f.originalname,
+    path: `/uploads/${f.filename}`,
+    type: f.mimetype,
+    size: f.size
+  }));
+
+  const existing = JSON.parse(section.images || '[]');
+  const existingFiles = JSON.parse(section.files || '[]');
+
+  const newImages = uploaded.filter(f => f.type.startsWith('image/'));
+  const newFiles = uploaded.filter(f => !f.type.startsWith('image/'));
+
+  const updatedImages = [...existing, ...newImages];
+  const updatedFiles = [...existingFiles, ...newFiles];
+
+  db.prepare('UPDATE sections SET images = ?, files = ? WHERE id = ?')
+    .run(JSON.stringify(updatedImages), JSON.stringify(updatedFiles), section.id);
+
+  res.json({ ok: true, images: updatedImages, files: updatedFiles });
+});
+
+// ═══════════════════════════════════════
+// START
+// ═══════════════════════════════════════
+
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Briefing App — http://localhost:${PORT}`);
+  console.log(`   Admin:  http://localhost:${PORT}/admin`);
+  console.log(`   Senha:  ${ADMIN_PASS}`);
+});

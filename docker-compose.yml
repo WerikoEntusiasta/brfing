@@ -1,0 +1,16 @@
+name: briefing-app
+version: "3.8"
+services:
+  briefing-app:
+    image: briefing-app:latest
+    container_name: briefing-app
+    restart: unless-stopped
+    ports:
+      - "3456:80"
+    environment:
+      - PORT=80
+      - NODE_ENV=production
+      - ADMIN_PASS=Br1f1ng@Ampl1f1ca2026
+    volumes:
+      - /DATA/AppData/briefing-app/data:/app/data
+      - /DATA/AppData/briefing-app/uploads:/app/uploads
